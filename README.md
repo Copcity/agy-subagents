@@ -12,11 +12,10 @@ Codex 主模型 ──agy_delegate(task, files)──▶ 本地路由估算 ─�
 
 ## 目录
 
+- [安装](#安装)
 - [解决什么问题](#解决什么问题)
 - [如何做到不损失主模型能力](#如何做到不损失主模型能力)
 - [特性](#特性)
-- [前置条件](#前置条件)
-- [安装](#安装)
 - [快速开始](#快速开始)
 - [返回结果](#返回结果)
 - [路由与成本模型](#路由与成本模型)
@@ -27,6 +26,80 @@ Codex 主模型 ──agy_delegate(task, files)──▶ 本地路由估算 ─�
 - [测试与基准](#测试与基准)
 - [已知限制](#已知限制)
 - [许可证](#许可证)
+
+## 安装
+
+### 让 Codex 自动安装（推荐）
+
+把下面这段提示词直接发给 Codex：
+
+```text
+请帮我安装 agy-subagents（https://github.com/Copcity/agy-subagents）：
+1. 检查前置条件：python --version 为 3.10+；agy 在 PATH 中或位于 %LOCALAPPDATA%\agy\bin\agy.exe。缺少任何一项就停下来告诉我，不要自行安装。
+2. 把仓库 clone 到 ~/.codex/skills/agy-subagents（Windows 为 $env:USERPROFILE\.codex\skills\agy-subagents）。目录已存在时不要覆盖，先问我。
+3. 注册 MCP：codex mcp add agy-subagents -- <python 绝对路径> "<安装目录>/scripts/agy_mcp_server.py"，再用 codex mcp get agy-subagents 确认。
+4. 在安装目录运行 python -m unittest discover -s tests，确认全部通过。
+5. 报告每一步结果，并提醒我新开一个 Codex 会话后生效。
+```
+
+Codex 无法确认 AGY 是否已登录 Google AI Pro 账号以及 `gemini-3.8-flash-high` 是否可用，这两项需要你在 Antigravity 中自行确认。
+
+### 手动安装
+
+#### 前置条件
+
+| 依赖 | 说明 |
+|---|---|
+| Python | 建议 3.10 及以上（在 3.14 上测试）；只用标准库 |
+| Antigravity（AGY）CLI | 本机可执行的 `agy`，需在 `PATH` 中，或位于 `%LOCALAPPDATA%\agy\bin\agy.exe`；也可用 `--agy <path>` 指定 |
+| 账号与模型 | 已在 AGY 中登录 Google AI Pro 账号，且 `gemini-3.8-flash-high` 可用；子代理调用消耗的是该账号的 Antigravity 额度 |
+| 主模型 | [Codex CLI](https://github.com/openai/codex)。本项目只针对 Codex 实验和优化 |
+
+主要在 Windows 上开发和测试，路径约定（`%LOCALAPPDATA%`、`$env:USERPROFILE`）以 Windows 为准；其他平台会回退到用户主目录。
+
+#### 1. 放到 Codex skills 目录
+
+```powershell
+git clone https://github.com/Copcity/agy-subagents.git "$env:USERPROFILE\.codex\skills\agy-subagents"
+```
+
+macOS / Linux：
+
+```bash
+git clone https://github.com/Copcity/agy-subagents.git ~/.codex/skills/agy-subagents
+```
+
+Codex 会读取 `SKILL.md`，在用户提到"agy子代理"或任务涉及长文件时自动触发技能（`agents/openai.yaml` 中 `allow_implicit_invocation: true`）。
+
+#### 2. 注册 MCP Server
+
+```powershell
+codex mcp add agy-subagents -- python "$env:USERPROFILE\.codex\skills\agy-subagents\scripts\agy_mcp_server.py"
+codex mcp get agy-subagents   # 检查是否注册成功
+```
+
+其他支持 stdio MCP 的 agent 可以用下面的等价配置接入。注意本项目只在 Codex 上实验和优化过：`SKILL.md` 的触发规则、精简的工具 schema、返回格式和使用指引都是按 Codex 调的，其他 agent 不一定会在合适的时机调用，也不一定会按定位核验结果，因此不保证能完全发挥效果。
+
+```json
+{
+  "mcpServers": {
+    "agy-subagents": {
+      "command": "python",
+      "args": ["C:/Users/<you>/.codex/skills/agy-subagents/scripts/agy_mcp_server.py"]
+    }
+  }
+}
+```
+
+修改脚本后需要新开一个 Codex 会话，MCP Server 才会重新加载。
+
+#### 3. 验证
+
+```powershell
+cd "$env:USERPROFILE\.codex\skills\agy-subagents"
+python -m unittest discover -s tests -v          # 35 个离线单元测试，不调用真实 AGY
+python benchmarks/benchmark_delegation.py         # 离线 mock 基准，无费用
+```
 
 ## 解决什么问题
 
@@ -71,63 +144,6 @@ Codex 主模型 ──agy_delegate(task, files)──▶ 本地路由估算 ─�
 - **安全默认**：拒绝凭据类文件和二进制文件；AGY 以 plan 模式、沙箱、禁用工具运行；文件内容视为不可信数据。
 - **中文友好**：BOM → UTF-8 → GB18030 解码；stdio 强制 UTF-8，兼容中文 Windows（GBK）环境与中文文件名。
 - **零依赖**：仅使用 Python 标准库。
-
-## 前置条件
-
-| 依赖 | 说明 |
-|---|---|
-| Python | 建议 3.10 及以上（在 3.14 上测试）；只用标准库 |
-| Antigravity（AGY）CLI | 本机可执行的 `agy`，需在 `PATH` 中，或位于 `%LOCALAPPDATA%\agy\bin\agy.exe`；也可用 `--agy <path>` 指定 |
-| 账号与模型 | 已在 AGY 中登录 Google AI Pro 账号，且 `gemini-3.8-flash-high` 可用；子代理调用消耗的是该账号的 Antigravity 额度 |
-| 主模型 | [Codex CLI](https://github.com/openai/codex)。本项目只针对 Codex 实验和优化 |
-
-主要在 Windows 上开发和测试，路径约定（`%LOCALAPPDATA%`、`$env:USERPROFILE`）以 Windows 为准；其他平台会回退到用户主目录。
-
-## 安装
-
-### 1. 放到 Codex skills 目录
-
-```powershell
-git clone https://github.com/Copcity/agy-subagents.git "$env:USERPROFILE\.codex\skills\agy-subagents"
-```
-
-macOS / Linux：
-
-```bash
-git clone https://github.com/Copcity/agy-subagents.git ~/.codex/skills/agy-subagents
-```
-
-Codex 会读取 `SKILL.md`，在用户提到"agy子代理"或任务涉及长文件时自动触发技能（`agents/openai.yaml` 中 `allow_implicit_invocation: true`）。
-
-### 2. 注册 MCP Server
-
-```powershell
-codex mcp add agy-subagents -- python "$env:USERPROFILE\.codex\skills\agy-subagents\scripts\agy_mcp_server.py"
-codex mcp get agy-subagents   # 检查是否注册成功
-```
-
-其他支持 stdio MCP 的 agent 可以用下面的等价配置接入。注意本项目只在 Codex 上实验和优化过：`SKILL.md` 的触发规则、精简的工具 schema、返回格式和使用指引都是按 Codex 调的，其他 agent 不一定会在合适的时机调用，也不一定会按定位核验结果，因此不保证能完全发挥效果。
-
-```json
-{
-  "mcpServers": {
-    "agy-subagents": {
-      "command": "python",
-      "args": ["C:/Users/<you>/.codex/skills/agy-subagents/scripts/agy_mcp_server.py"]
-    }
-  }
-}
-```
-
-修改脚本后需要新开一个 Codex 会话，MCP Server 才会重新加载。
-
-### 3. 验证
-
-```powershell
-cd "$env:USERPROFILE\.codex\skills\agy-subagents"
-python -m unittest discover -s tests -v          # 35 个离线单元测试，不调用真实 AGY
-python benchmarks/benchmark_delegation.py         # 离线 mock 基准，无费用
-```
 
 ## 快速开始
 
