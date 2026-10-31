@@ -4,6 +4,9 @@
 
 > **适用范围**：本项目只针对 **Codex** 做过实验和优化（技能触发方式、工具 schema 体积、返回格式、提示词都按 Codex 调过）。其他支持 MCP 的 agent 也能调用，但不保证能完全发挥效果。
 
+> [!IMPORTANT]
+> **使用前必须先登录 Antigravity CLI（`agy`）。** 本项目在后台以无交互方式调用 `agy`，无法弹出登录页面；没登录时每次委派都会失败。在终端运行 `agy models`，能列出 `gemini-3.8-flash-high` 就说明已登录、模型可用。如果报错或要求登录，先在终端运行一次 `agy`，用 Google AI Pro 账号完成登录。详见[登录 Antigravity](#登录-antigravity)。
+
 ```text
 Codex 主模型 ──agy_delegate(task, files)──▶ 本地路由估算 ──▶ direct：主模型自己处理
                                                │
@@ -36,13 +39,14 @@ Codex 主模型 ──agy_delegate(task, files)──▶ 本地路由估算 ─�
 ```text
 请帮我安装 agy-subagents（https://github.com/Copcity/agy-subagents）：
 1. 检查前置条件：python --version 为 3.10+；agy 在 PATH 中或位于 %LOCALAPPDATA%\agy\bin\agy.exe。缺少任何一项就停下来告诉我，不要自行安装。
-2. 把仓库 clone 到 ~/.codex/skills/agy-subagents（Windows 为 $env:USERPROFILE\.codex\skills\agy-subagents）。目录已存在时不要覆盖，先问我。
-3. 注册 MCP：codex mcp add agy-subagents -- <python 绝对路径> "<安装目录>/scripts/agy_mcp_server.py"，再用 codex mcp get agy-subagents 确认。
-4. 在安装目录运行 python -m unittest discover -s tests，确认全部通过。
-5. 报告每一步结果，并提醒我新开一个 Codex 会话后生效。
+2. 检查 Antigravity 登录：运行 agy models（设 60 秒超时），确认输出里有 gemini-3.8-flash-high。失败、超时或要求登录时停下来，让我先在终端运行 agy 完成登录，不要替我登录。
+3. 把仓库 clone 到 ~/.codex/skills/agy-subagents（Windows 为 $env:USERPROFILE\.codex\skills\agy-subagents）。目录已存在时不要覆盖，先问我。
+4. 注册 MCP：codex mcp add agy-subagents -- <python 绝对路径> "<安装目录>/scripts/agy_mcp_server.py"，再用 codex mcp get agy-subagents 确认。
+5. 在安装目录运行 python -m unittest discover -s tests，确认全部通过。
+6. 报告每一步结果，并提醒我新开一个 Codex 会话后生效。
 ```
 
-Codex 无法确认 AGY 是否已登录 Google AI Pro 账号以及 `gemini-3.8-flash-high` 是否可用，这两项需要你在 Antigravity 中自行确认。
+登录需要你本人完成 Google 账号授权，Codex 只负责检查是否已登录。
 
 ### 手动安装
 
@@ -52,10 +56,27 @@ Codex 无法确认 AGY 是否已登录 Google AI Pro 账号以及 `gemini-3.8-fl
 |---|---|
 | Python | 建议 3.10 及以上（在 3.14 上测试）；只用标准库 |
 | Antigravity（AGY）CLI | 本机可执行的 `agy`，需在 `PATH` 中，或位于 `%LOCALAPPDATA%\agy\bin\agy.exe`；也可用 `--agy <path>` 指定 |
-| 账号与模型 | 已在 AGY 中登录 Google AI Pro 账号，且 `gemini-3.8-flash-high` 可用；子代理调用消耗的是该账号的 Antigravity 额度 |
+| 账号与模型 | **已在 Antigravity CLI 中登录** Google AI Pro 账号，且 `gemini-3.8-flash-high` 可用；子代理调用消耗的是该账号的 Antigravity 额度。见[登录 Antigravity](#登录-antigravity) |
 | 主模型 | [Codex CLI](https://github.com/openai/codex)。本项目只针对 Codex 实验和优化 |
 
 主要在 Windows 上开发和测试，路径约定（`%LOCALAPPDATA%`、`$env:USERPROFILE`）以 Windows 为准；其他平台会回退到用户主目录。
+
+#### 登录 Antigravity
+
+本项目自己不读取、不保存任何账号信息。它只是启动 `agy` 命令行进程，登录状态完全由 Antigravity CLI 管理：CLI 登录后把凭据保存在系统钥匙串里（Windows 为"凭据管理器"），之后每次调用自动使用。
+
+1. 在终端运行 `agy`，按 CLI 的提示用 Google AI Pro 账号完成登录，然后退出。
+2. 运行 `agy models`，确认输出里有 `gemini-3.8-flash-high`：
+
+   ```text
+   Fetching available models...
+   gemini-3.8-flash-high	Gemini 3.8 Flash (High)
+   ...
+   ```
+
+**只登录了 Antigravity 桌面端的情况**：桌面端和 CLI 是两个程序，各有自己的数据目录，作者没有验证过桌面端的登录能否直接被 CLI 使用。请以 `agy models` 的结果为准：能列出模型就可以用；报错或要求登录，就在终端运行一次 `agy` 登录 CLI。
+
+登录过期或切换账号后，重新执行上面两步即可，不需要重装本项目。
 
 #### 1. 放到 Codex skills 目录
 
