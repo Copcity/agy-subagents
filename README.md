@@ -21,9 +21,9 @@ Codex 主模型 ──agy_delegate(task, files)──▶ 本地路由估算 ─�
 - [路由与成本模型](#路由与成本模型)
 - [参数参考](#参数参考)
 - [安全与隔离](#安全与隔离)
-- [缓存与账本](#缓存与账本)
+- [缓存](#缓存)
 - [项目结构](#项目结构)
-- [测试与基准](#测试与基准)
+- [测试](#测试)
 - [已知限制](#已知限制)
 - [许可证](#许可证)
 
@@ -97,8 +97,7 @@ codex mcp get agy-subagents   # 检查是否注册成功
 
 ```powershell
 cd "$env:USERPROFILE\.codex\skills\agy-subagents"
-python -m unittest discover -s tests -v          # 35 个离线单元测试，不调用真实 AGY
-python benchmarks/benchmark_delegation.py         # 离线 mock 基准，无费用
+python -m unittest discover -s tests -v          # 离线单元测试，不调用真实 AGY，无费用
 ```
 
 ## 解决什么问题
@@ -140,7 +139,6 @@ python benchmarks/benchmark_delegation.py         # 离线 mock 基准，无费�
 - **多视角审查**：可指定 `perspectives`（如 `reader`、`critic`）获得互补报告。
 - **精简返回**：默认紧凑 JSON 契约；只在有异常信号时才出现额外字段，减少主模型读回的 token。
 - **缓存**：成功结果按 SHA-256 缓存 7 天，命中时 0 次 AGY 调用。
-- **账本**：每次调用记录指标（不含原文和结果），可随时汇总开销。
 - **安全默认**：拒绝凭据类文件和二进制文件；AGY 以 plan 模式、沙箱、禁用工具运行；文件内容视为不可信数据。
 - **中文友好**：BOM → UTF-8 → GB18030 解码；stdio 强制 UTF-8，兼容中文 Windows（GBK）环境与中文文件名。
 - **零依赖**：仅使用 Python 标准库。
@@ -188,9 +186,7 @@ python scripts/agy_delegate.py `
 ```json
 {
   "status": "success",
-  "result": {"answer": "...", "evidence": ["paper.txt:L120"], "uncertainties": [], "verify": []},
-  "tokens": {"agy_calls": 3, "agy_total": 77446, "gpt_saved_est": 52475},
-  "run_id": "20261031-141717-b6b25515"
+  "result": {"answer": "...", "evidence": ["paper.txt:L120"], "uncertainties": [], "verify": []}
 }
 ```
 
@@ -210,7 +206,6 @@ python scripts/agy_delegate.py `
 | `truncated_reports` | 有报告超长被截断 | 可能有遗漏；缩小范围或提高 `max_output_chars` |
 | `invalid_locators` | 有定位超出文件行数 | 相关结论可疑，必须回原文核验 |
 | `result_kind=unmerged_map_reports` | 归并失败，返回分块报告 | 主模型自行合并 |
-| `tokens` / `run_id` | 开销摘要 / 账本记录号 | 可用 `agy_ledger.py --run-id <id>` 查明细 |
 
 可选字段只在有异常信号时出现，不出现即表示正常。错误类别：`permission_denied`、`timeout`、`overall_timeout`、`transient`、`model_or_protocol_error`、`worker_error`。
 
@@ -260,7 +255,6 @@ token 估算使用字符启发式（非 ASCII 约 0.9 token/字，ASCII 约 0.25
 | `requires_gpt` | false | 强制 direct |
 | `cache_enabled` / `cache_ttl_days` | true / 7 | 缓存开关与有效期 |
 | `max_file_bytes` | 8 MiB | 单文件上限；总计 32 MiB、16 个文件、32 个任务 |
-| `telemetry` | `summary` | `full` 返回内部完整 envelope，仅用于调试 |
 | `allow_sensitive` | false | 放行凭据类文件，须用户明确同意 |
 
 另有批量工具 `agy_subagents`，用于需要多份互相独立报告的场景。完整协议、批量工具用法和 CLI 参数见 [references/protocol.md](references/protocol.md)，或运行 `python scripts/agy_delegate.py --help`。
@@ -275,25 +269,15 @@ token 估算使用字符启发式（非 ASCII 约 0.9 token/字，ASCII 约 0.25
 - **副作用留在主模型。** 文件修改、命令执行、发布和对外通信都不交给 AGY。
 - **并发上限。** MCP 工具调用在线程池中执行（最多 16 个并发调用），短路由不会排在长委派后面；全进程同时运行的 AGY 子进程上限由 `AGY_SUBAGENTS_MAX_PROCESSES` 控制（默认 8）。
 
-## 缓存与账本
+## 缓存
 
-**缓存**：成功结果按 SHA-256（prompt、模型、模式、权限、输出预算）存放在 `%LOCALAPPDATA%\agy\cache\agy-subagents`，有效期 7 天，过期文件定期清理。源文或任务一变即不命中；写缓存失败不影响结果。实测命中耗时约 0.2 秒、0 次 AGY 调用。
-
-**账本**：每次调用追加一行到 `%LOCALAPPDATA%\agy\telemetry\agy-subagents\runs.jsonl`，只含指标（路由估算、usage、缓存、错误、定位检查），**不含原文和结果**。
-
-```powershell
-python scripts/agy_ledger.py              # 汇总全部记录
-python scripts/agy_ledger.py --last 20    # 最近 20 次
-python scripts/agy_ledger.py --run-id ID  # 单次调用的完整记录
-```
+成功结果按 SHA-256（prompt、模型、模式、权限、输出预算）存放在 `%LOCALAPPDATA%\agy\cache\agy-subagents`，有效期 7 天，过期文件定期清理。源文或任务一变即不命中；写缓存失败不影响结果。实测命中耗时约 0.2 秒、0 次 AGY 调用。
 
 环境变量：
 
 | 变量 | 作用 |
 |---|---|
-| `AGY_SUBAGENTS_LEDGER_DIR` | 修改账本目录 |
-| `AGY_SUBAGENTS_LEDGER=0` | 关闭账本 |
-| `AGY_SUBAGENTS_CACHE=0` | 全局关闭缓存（评测用） |
+| `AGY_SUBAGENTS_CACHE=0` | 全局关闭缓存 |
 | `AGY_SUBAGENTS_MAX_PROCESSES` | AGY 子进程并发上限，默认 8 |
 
 ## 项目结构
@@ -305,24 +289,18 @@ agy-subagents/
 ├── scripts/
 │   ├── agy_mcp_server.py        # stdio MCP Server，暴露 agy_delegate / agy_subagents
 │   ├── agy_delegate.py          # 委派核心：路由估算、读文件、分块、map/reduce；也是 CLI
-│   ├── run_cluster.py           # 底层：AGY 进程执行、缓存、重试、并行、账本；批量 CLI
-│   └── agy_ledger.py            # 汇总本机账本
+│   └── run_cluster.py           # 底层：AGY 进程执行、缓存、重试、并行；批量 CLI
 ├── references/protocol.md       # 完整协议、参数与成本模型
-├── tests/test_delegation.py     # 离线单元测试（mock AGY）
-└── benchmarks/benchmark_delegation.py  # 离线 token 开销与事实覆盖率基准
+└── tests/test_delegation.py     # 离线单元测试（mock AGY）
 ```
 
-## 测试与基准
+## 测试
 
 ```powershell
 python -m unittest discover -s tests -v
-python benchmarks/benchmark_delegation.py                    # 离线 mock，无费用
-python benchmarks/benchmark_delegation.py --compare <旧副本>  # 改动前后对比
 ```
 
 单元测试覆盖路由判断、分块与全局行号、缓存命中与失效、重试与超时取消、归并失败降级、敏感文件拒绝、GBK/GB18030 解码、中文路径在 GBK 区域设置下的 stdio 往返等场景，全部使用 mock，不产生费用。
-
-基准经 MCP 层测量主模型读写的 token、每轮 schema 开销、mock AGY 调用次数和事实覆盖率（token 为字符启发式估算）。
 
 真实 AGY 下的实测（合成数据）：
 
@@ -340,7 +318,7 @@ python benchmarks/benchmark_delegation.py --compare <旧副本>  # 改动前后�
 - **AGY 侧总开销更高。** 本项目节约的是主模型 token，AGY 侧消耗的是 Google AI Pro 的 Antigravity 额度，总 token 通常更高；额度用尽时子代理调用会失败，需要主模型自己处理。中等长度任务在 `balanced` 模式下基本都会 direct。
 - **token 估算是启发式。** 路由判断基于字符数估算，不是真实 tokenizer。
 - **依赖本机 Antigravity。** 需要自行安装并登录 AGY CLI；模型名写在 `agy_delegate.py` 和 `agy_mcp_server.py` 中。
-- **主要在 Windows 上验证。** 其他平台理论可用，但缓存与账本路径会回退到用户主目录。
+- **主要在 Windows 上验证。** 其他平台理论可用，但缓存路径会回退到用户主目录。
 
 ## 许可证
 

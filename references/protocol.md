@@ -8,8 +8,7 @@
 |---|---|
 | `scripts/agy_mcp_server.py` | stdio MCP server（Codex 全局注册名 `agy-subagents`），列出 `agy_delegate`、`agy_subagents` |
 | `scripts/agy_delegate.py` | 委派核心：路由估算、读文件、分块、map/reduce、精简返回；也是无 MCP 时的 CLI |
-| `scripts/run_cluster.py` | 底层：AGY 进程执行、缓存、重试、并行、账本；也是批量 CLI |
-| `scripts/agy_ledger.py` | 汇总本机账本 |
+| `scripts/run_cluster.py` | 底层：AGY 进程执行、缓存、重试、并行；也是批量 CLI |
 
 注册（已在本机完成）：`codex mcp add agy-subagents -- <python.exe> "$env:USERPROFILE\.codex\skills\agy-subagents\scripts\agy_mcp_server.py"`；检查：`codex mcp get agy-subagents`。修改脚本后需新开 Codex 会话才会重新加载。
 
@@ -51,35 +50,33 @@ token 估算是字符启发式（非 ASCII 约 0.9 token/字，ASCII 约 0.25 to
 | `requires_gpt` | false | 强制 direct |
 | `cache_enabled` / `cache_ttl_days` | true / 7 | 见缓存 |
 | `max_file_bytes` | 8 MiB | 单文件上限；总计 32 MiB、16 个文件、32 个任务 |
-| `telemetry` | `summary` | `full` 返回内部完整 envelope，仅调试 |
 | `allow_sensitive` | false | 放行凭据类文件，须用户明确同意 |
 
-CLI 同名参数：`agy_delegate.py --task --file(可重复) --perspective(可重复) --output-contract --difficulty --chunk-chars --cost-mode --no-cache --telemetry --allow-sensitive --output-file …`；`--output-file` 把完整 envelope 落盘，stdout 只打印状态。
+CLI 同名参数：`agy_delegate.py --task --file(可重复) --perspective(可重复) --output-contract --difficulty --chunk-chars --cost-mode --no-cache --allow-sensitive --output-file …`；`--output-file` 把结果落盘，stdout 只打印状态。
 
 ## 返回协议
 
 成功：
 
 ```json
-{"status":"success","result":{...},"tokens":{"agy_calls":3,"agy_total":77446,"gpt_saved_est":52475},"run_id":"20261031-141717-b6b25515"}
+{"status":"success","result":{...}}
 ```
 
 可选字段只在有信号时出现：`coverage_complete:false`、`truncated_reports`、`invalid_locators`、`failed_workers`+`errors:[{id,category,retryable,attempts}]`、`error`、`result_kind:"unmerged_map_reports"`（归并失败或总时限不够归并时，`result` 为有上限的 `{"unmerged_reports":[...]}`）。
 
-direct：`{"status":"direct","action":"handle_in_parent","reason":"…","source_chars":N,"hint":"…(仅高难度长文)","run_id":"…"}`。
+direct：`{"status":"direct","action":"handle_in_parent","reason":"…","source_chars":N,"hint":"…(仅高难度长文)"}`。
 
 错误类别：`permission_denied`、`timeout`、`overall_timeout`、`transient`、`model_or_protocol_error`、`worker_error`。MCP 只返回 text content（不带 structuredContent，避免同一内容进上下文两次）；`isError` 仅在 `status=error`，或 `partial` 且没有任何可用结果时为 true。CLI 退出码：0 成功或 direct，1 部分/失败，2 输入或环境错误。
 
-## 缓存、账本与隔离
+## 缓存与隔离
 
-- 缓存：成功的 compact 阶段结果按 SHA-256（prompt、模型、模式、权限、输出预算）存到 `%LOCALAPPDATA%\agy\cache\agy-subagents`，TTL 7 天，过期文件定期清理。命中时 `usage` 为空，`tokens.cache_hits` 计数。源文或任务一变即不命中。写缓存失败不影响结果。
-- 账本：每次调用追加一行到 `%LOCALAPPDATA%\agy\telemetry\agy-subagents\runs.jsonl`，只含指标（route 估算、usage、cache、错误、定位检查），不含原文和结果。`AGY_SUBAGENTS_LEDGER_DIR` 改目录，`AGY_SUBAGENTS_LEDGER=0` 关闭；`AGY_SUBAGENTS_CACHE=0` 全局关闭缓存（评测用）。`python scripts/agy_ledger.py [--last N | --run-id ID]`。
+- 缓存：成功的 compact 阶段结果按 SHA-256（prompt、模型、模式、权限、输出预算）存到 `%LOCALAPPDATA%\agy\cache\agy-subagents`，TTL 7 天，过期文件定期清理。命中时不调用 AGY。源文或任务一变即不命中。写缓存失败不影响结果。`AGY_SUBAGENTS_CACHE=0` 全局关闭缓存。
 - 隔离：每个任务独立 AGY 会话；`--mode plan --sandbox --disable-slash-commands`；map 与 reduce prompt 都禁止工具和外部操作，并声明源文为不可信数据。凭据类文件名/目录默认拒绝；含 NUL 字节的二进制文件拒绝；按 BOM → UTF-8 → GB18030 解码。
 - 并发：MCP 工具调用在线程池执行（最多 16 个并发调用），direct 路由不会排在长委派后面；全进程同时运行的 AGY 子进程上限 `AGY_SUBAGENTS_MAX_PROCESSES`（默认 8）。stdio 强制 UTF-8（中文 Windows 默认 GBK）。
 
 ## 批量工具 `agy_subagents`（高级）
 
-只在需要多份互相独立的报告时使用。`prompts` 元素可以是字符串，或 `{id, prompt}`、`{id, instruction, file|files, chunk_chars, overlap_chars, difficulty, requires_gpt}`。路由只把桥接从文件读取的内容计为可节省部分；内联长 `prompt` 返回 direct。返回 `{status, failed, results:[{id, status, response | action+reason | category+retryable}], tokens, run_id}`；`output_file` 时完整 envelope 落盘、只返回状态。其他参数：`max_response_chars`、`result_mode`（`full` 返回原始长文，避免使用）、`allow_tools`，以及与上表同名的 `workers`、`timeout`、`total_timeout`、`retries`、`transport`、`cache_*`、`cost_mode`、`telemetry`、`allow_sensitive`。CLI 等价物：`run_cluster.py --prompts-file tasks.json --output-file out.json`。
+只在需要多份互相独立的报告时使用。`prompts` 元素可以是字符串，或 `{id, prompt}`、`{id, instruction, file|files, chunk_chars, overlap_chars, difficulty, requires_gpt}`。路由只把桥接从文件读取的内容计为可节省部分；内联长 `prompt` 返回 direct。返回 `{status, failed, results:[{id, status, response | action+reason | category+retryable}]}`；`output_file` 时完整结果落盘、只返回状态。其他参数：`max_response_chars`、`result_mode`（`full` 返回原始长文，避免使用）、`allow_tools`，以及与上表同名的 `workers`、`timeout`、`total_timeout`、`retries`、`transport`、`cache_*`、`cost_mode`、`allow_sensitive`。CLI 等价物：`run_cluster.py --prompts-file tasks.json --output-file out.json`。
 
 旧工具名 `agy_summarize_file`（`path`、`task`）仍可调用，等价于单文件 `agy_delegate` 并把 `result` 改名为 `summary`，但已不在工具列表中。
 
@@ -90,12 +87,8 @@ direct：`{"status":"direct","action":"handle_in_parent","reason":"…","source_
 - 缓存命中：0.2 秒、0 次 AGY 调用、结果一致。
 - `file:L<n>` 定位：单块 8/8、跨块（9.5 万字、4 次调用）10/10 精确命中原文行号。默认紧凑 JSON 契约使同一结果从 626 降到 262 token。
 
-## 测试与基准
+## 测试
 
 ```powershell
 python -m unittest discover -s tests -v
-python benchmarks/benchmark_delegation.py                    # 离线 mock，无费用
-python benchmarks/benchmark_delegation.py --compare <旧副本>  # 前后对比
 ```
-
-基准经 MCP 层测量主模型读写的 token、每轮 schema、mock AGY 调用和事实覆盖率；token 为字符启发式估算。

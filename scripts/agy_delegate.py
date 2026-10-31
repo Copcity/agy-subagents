@@ -186,22 +186,6 @@ def run_agent(
 
 
 
-def aggregate_usage(results: list[dict[str, Any]]) -> dict[str, int]:
-    return run_cluster.aggregate_usage(results)
-
-
-def aggregate_cached_usage(results: list[dict[str, Any]]) -> dict[str, int]:
-    return run_cluster.summarize_runs(results)["cache_avoided_usage"]
-
-
-def aggregate_cache_stats(results: list[dict[str, Any]]) -> dict[str, int]:
-    return run_cluster.aggregate_cache(results)
-
-
-def aggregate_prompt_estimates(results: list[dict[str, Any]]) -> dict[str, int]:
-    return run_cluster.aggregate_prompt_estimates(results)
-
-
 def route_estimate(
     task: str,
     contract: str,
@@ -272,36 +256,13 @@ def route_estimate(
     else:
         reason = "long source and bounded return are expected to reduce GPT context"
     delegated = reason.startswith("long source")
-    agy_calls = candidate_agy_calls if delegated else 0
-    fixed_context_tokens = agy_calls * run_cluster.ESTIMATED_FIXED_CONTEXT_TOKENS
-    repeated_instruction_tokens = candidate_repeated_instruction_tokens if delegated else 0
-    estimated_agy_overhead = fixed_context_tokens + repeated_instruction_tokens
     return {
         "decision": "delegate" if delegated else "direct",
         "reason": reason,
         "source_chars": source_chars,
-        "estimated_source_tokens": source_tokens,
-        "estimated_tool_input_tokens": tool_input_tokens,
-        "estimated_return_tokens": expected_return_tokens,
-        "estimated_gpt_input_tokens_saved": estimated_savings,
-        "estimated_agy_calls": agy_calls,
-        "estimated_candidate_agy_calls": candidate_agy_calls,
-        "estimated_agy_fixed_context_tokens": fixed_context_tokens,
-        "estimated_candidate_agy_fixed_context_tokens": candidate_fixed_context_tokens,
-        "estimated_agy_duplicate_instruction_tokens": repeated_instruction_tokens,
-        "estimated_candidate_agy_input_tokens": candidate_agy_input_tokens,
-        "estimated_candidate_agy_total_tokens": estimated_agy_total_tokens,
-        "estimated_candidate_agy_overhead_tokens": candidate_agy_overhead,
-        "estimated_agy_input_tokens": candidate_agy_input_tokens if delegated else 0,
-        "estimated_agy_duplicate_source_tokens": duplicate_source_tokens if delegated else 0,
-        "estimated_agy_reduce_input_tokens": reduce_input_tokens if delegated else 0,
-        "estimated_direct_tokens": estimated_direct_tokens,
-        "estimated_agy_total_tokens": estimated_agy_total_tokens if delegated else 0,
-        "estimated_agy_overhead_tokens": estimated_agy_overhead,
+        "agy_calls": candidate_agy_calls,
         "difficulty": difficulty,
         "requires_gpt": bool(requires_gpt),
-        "cost_mode": cost_mode,
-        "estimator": "local character heuristic; not tokenizer telemetry",
     }
 
 
@@ -357,25 +318,8 @@ def route_prompt_estimate(
         "decision": "delegate" if delegated else "direct",
         "reason": reason,
         "source_chars": source_chars,
-        "estimated_source_tokens": source_tokens,
-        "estimated_tool_input_tokens": estimated_tool_input_tokens,
-        "estimated_return_tokens": expected_return_tokens,
-        "estimated_gpt_input_tokens_saved": estimated_savings,
-        "estimated_agy_calls": 1 if delegated else 0,
-        "estimated_candidate_agy_calls": 1,
-        "estimated_agy_fixed_context_tokens": run_cluster.ESTIMATED_FIXED_CONTEXT_TOKENS if delegated else 0,
-        "estimated_candidate_agy_fixed_context_tokens": run_cluster.ESTIMATED_FIXED_CONTEXT_TOKENS,
-        "estimated_agy_duplicate_instruction_tokens": instruction_tokens if delegated else 0,
-        "estimated_candidate_agy_input_tokens": source_tokens + instruction_tokens,
-        "estimated_candidate_agy_total_tokens": estimated_agy_total_tokens,
-        "estimated_candidate_agy_overhead_tokens": estimated_overhead,
-        "estimated_agy_overhead_tokens": estimated_overhead if delegated else 0,
-        "estimated_direct_tokens": estimated_direct_tokens,
-        "estimated_agy_total_tokens": estimated_agy_total_tokens if delegated else 0,
         "difficulty": difficulty,
         "requires_gpt": bool(requires_gpt),
-        "cost_mode": cost_mode,
-        "estimator": "local character heuristic; not tokenizer telemetry",
     }
 
 
@@ -395,51 +339,10 @@ def public_errors(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def serialized(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
-def returned_context(final: Any, routing: dict[str, Any]) -> dict[str, int]:
-    text = serialized(final)
-    return {
-        "estimated_input_tokens_saved": routing["estimated_gpt_input_tokens_saved"],
-        "returned_chars": len(text),
-        "returned_tokens_estimated": run_cluster.estimate_tokens(text),
-    }
-
-
-def public_envelope(envelope: dict[str, Any], *, tool: str, telemetry: str = "summary", ledger_dir: str | None = None) -> dict[str, Any]:
-    """Shrink a delegation envelope to what the parent GPT needs.
-
-    The full route/usage/cache telemetry is appended to the local ledger and
-    referenced by ``run_id``; only the deliverable, coverage signals and a
-    one-line token summary go back into GPT context. ``telemetry="full"``
-    returns the internal envelope unchanged (debugging only).
-    """
-    run_id = run_cluster.new_run_id()
+def public_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
+    """Shrink a delegation envelope to what the parent GPT needs: the
+    deliverable plus coverage signals."""
     route = envelope.get("route") or {}
-    record = {
-        "run_id": run_id,
-        "tool": tool,
-        "status": envelope.get("status"),
-        "route": route,
-        "workers": envelope.get("workers", 0),
-        "failed_workers": envelope.get("failed_workers", 0),
-        "truncated_reports": envelope.get("truncated_reports", 0),
-        "errors": envelope.get("errors", []),
-        "usage": run_cluster.nonzero(envelope.get("usage")),
-        "cache": envelope.get("cache", {}),
-        "cache_avoided_usage": run_cluster.nonzero(envelope.get("cache_avoided_usage")),
-        "agy_prompt_tokens_estimated": envelope.get("agy_prompt_tokens_estimated", {}),
-        "gpt_context": envelope.get("gpt_context", {}),
-        "locator_check": envelope.get("locator_check", {}),
-    }
-    run_cluster.ledger_write(record, ledger_dir)
-    if telemetry == "full":
-        return {**envelope, "run_id": run_id}
-
     status = envelope.get("status")
     if status == "direct":
         public: dict[str, Any] = {"status": "direct", "action": "handle_in_parent", "reason": route.get("reason")}
@@ -450,7 +353,6 @@ def public_envelope(envelope: dict[str, Any], *, tool: str, telemetry: str = "su
             # source: delegate a low-difficulty extraction first.
             public["hint"] = ("To avoid reading the whole source, first call agy_delegate with difficulty=low to extract "
                               "the relevant passages with file:L locators, then reason over that yourself.")
-        public["run_id"] = run_id
         return public
     # Only fields that carry a signal are emitted; absence means "fine".
     public = {"status": status, "result": envelope.get("result")}
@@ -468,19 +370,6 @@ def public_envelope(envelope: dict[str, Any], *, tool: str, telemetry: str = "su
         public["errors"] = envelope.get("errors", [])
     if envelope.get("error"):
         public["error"] = envelope["error"]
-    usage = envelope.get("usage") or {}
-    cache = envelope.get("cache") or {}
-    public["tokens"] = {
-        key: value
-        for key, value in {
-            "agy_calls": int(cache.get("misses", 0) or 0),
-            "agy_total": int(usage.get("total_tokens", 0) or 0),
-            "cache_hits": int(cache.get("hits", 0) or 0),
-            "gpt_saved_est": int(route.get("estimated_gpt_input_tokens_saved", 0) or 0),
-        }.items()
-        if value
-    }
-    public["run_id"] = run_id
     return public
 
 
@@ -582,8 +471,6 @@ def delegate(
             "failed_workers": 0,
             "errors": [],
             "coverage_complete": False,
-            "usage": {},
-            "cache": {"hits": 0, "misses": 0, "avoided_input_tokens": 0},
             "total_timeout": total_timeout,
         }
     if not agy:
@@ -683,7 +570,7 @@ def delegate(
     errors = public_errors(bad)
     truncated_reports = sum(bool(item.get("truncated")) for item in good)
     if not good:
-        return {"status": "error", "error": "all delegated workers failed", "workers": len(mapped), "failed_workers": len(bad), "missing_worker_ids": missing_ids, "errors": errors, "coverage_complete": False, "result": None, "route": routing, "usage": aggregate_usage(mapped), "agy_prompt_tokens_estimated": aggregate_prompt_estimates(mapped), "cache": aggregate_cache_stats(mapped), "cache_avoided_usage": aggregate_cached_usage(mapped)}
+        return {"status": "error", "error": "all delegated workers failed", "workers": len(mapped), "failed_workers": len(bad), "missing_worker_ids": missing_ids, "errors": errors, "coverage_complete": False, "result": None, "route": routing}
 
     # One successful job with no split/role fan-out is already the final answer.
     if len(good) == 1 and len(mapped) == 1:
@@ -697,12 +584,7 @@ def delegate(
             "missing_worker_ids": missing_ids,
             "errors": errors,
             "coverage_complete": not bad,
-            "usage": aggregate_usage(mapped),
-            "agy_prompt_tokens_estimated": aggregate_prompt_estimates(mapped),
-            "cache": aggregate_cache_stats(mapped),
-            "cache_avoided_usage": aggregate_cached_usage(mapped),
             "route": routing,
-            "gpt_context": returned_context(final, routing),
             "locator_check": check_locators(final, line_counts),
         }
 
@@ -737,11 +619,7 @@ def delegate(
             "missing_worker_ids": missing_ids,
             "errors": errors,
             "coverage_complete": False,
-            "usage": aggregate_usage(mapped),
-            "agy_prompt_tokens_estimated": aggregate_prompt_estimates(mapped),
             "route": routing,
-            "cache": aggregate_cache_stats(mapped),
-            "cache_avoided_usage": aggregate_cached_usage(mapped),
             "error": "deadline left no time for reduction; result holds unmerged map reports - merge and verify them yourself",
         }
     reduced = run_agent(
@@ -760,11 +638,7 @@ def delegate(
             "missing_worker_ids": missing_ids + ["reduce"],
             "errors": errors + public_errors([reduced]),
             "coverage_complete": False,
-            "usage": aggregate_usage(mapped + [reduced]),
-            "agy_prompt_tokens_estimated": aggregate_prompt_estimates(mapped + [reduced]),
             "route": routing,
-            "cache": aggregate_cache_stats(mapped + [reduced]),
-            "cache_avoided_usage": aggregate_cached_usage(mapped + [reduced]),
             "error": "internal reduction failed; result holds unmerged map reports - merge and verify them yourself",
         }
     final = bounded_result(reduced.get("response", ""), max_output_chars)
@@ -777,12 +651,7 @@ def delegate(
         "missing_worker_ids": missing_ids,
         "errors": errors,
         "coverage_complete": not bad,
-        "usage": aggregate_usage(mapped + [reduced]),
-        "agy_prompt_tokens_estimated": aggregate_prompt_estimates(mapped + [reduced]),
-        "cache": aggregate_cache_stats(mapped + [reduced]),
-        "cache_avoided_usage": aggregate_cached_usage(mapped + [reduced]),
         "route": routing,
-        "gpt_context": returned_context(final, routing),
         "locator_check": check_locators(final, line_counts),
     }
 
@@ -810,8 +679,7 @@ def main() -> int:
     parser.add_argument("--no-cache", action="store_true", help="disable the user-local TTL cache")
     parser.add_argument("--cache-ttl-days", type=int, default=7)
     parser.add_argument("--cwd", default=None, help="reserved working-directory value; delegated analysis remains tool-isolated")
-    parser.add_argument("--output-file", help="write the full internal envelope to this file; stdout stays compact")
-    parser.add_argument("--telemetry", choices=("summary", "full"), default="summary", help="summary returns only the deliverable and a token line; full is for debugging")
+    parser.add_argument("--output-file", help="write the result to this file; stdout prints only the status")
     parser.add_argument("--allow-sensitive", action="store_true", help="allow likely credential files; only with explicit user authorization")
     run_cluster.configure_stdio()
     args = parser.parse_args()
@@ -848,12 +716,12 @@ def main() -> int:
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
         return 2
-    public = public_envelope(envelope, tool="agy_delegate.py", telemetry=args.telemetry)
+    public = public_envelope(envelope)
     if args.output_file:
         path = run_cluster.expand_path(args.output_file)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({**envelope, "run_id": public["run_id"]}, ensure_ascii=False) + "\n", encoding="utf-8")
-        print(json.dumps({"status": envelope.get("status"), "output_file": str(path), "failed_workers": envelope.get("failed_workers", 0), "run_id": public["run_id"]}, ensure_ascii=False))
+        path.write_text(json.dumps(public, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(json.dumps({"status": envelope.get("status"), "output_file": str(path), "failed_workers": envelope.get("failed_workers", 0)}, ensure_ascii=False))
     else:
         print(json.dumps(public, ensure_ascii=False))
     return 0 if envelope.get("status") in {"success", "direct"} else 1

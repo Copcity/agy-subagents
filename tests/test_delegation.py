@@ -15,13 +15,11 @@ import agy_delegate
 import agy_mcp_server
 import run_cluster
 
-_LEDGER_TEMP = tempfile.TemporaryDirectory()
 _CACHE_TEMP = tempfile.TemporaryDirectory()
 
 
 def setUpModule() -> None:
-    # Never write test telemetry or cache entries into the real user profile.
-    run_cluster.DEFAULT_LEDGER_DIR = Path(_LEDGER_TEMP.name)
+    # Never write test cache entries into the real user profile.
     run_cluster.DEFAULT_CACHE_DIR = Path(_CACHE_TEMP.name)
 
 
@@ -35,8 +33,6 @@ class DelegationTests(unittest.TestCase):
         self.assertEqual(result["status"], "direct")
         self.assertEqual(result["workers"], 0)
         self.assertEqual(result["route"]["decision"], "direct")
-        self.assertEqual(result["route"]["estimated_agy_calls"], 0)
-        self.assertEqual(result["route"]["estimated_agy_fixed_context_tokens"], 0)
 
     def test_mcp_batch_short_prompt_routes_direct_before_agy_lookup(self) -> None:
         with patch.object(run_cluster, "resolve_agy", side_effect=AssertionError("must not resolve AGY")):
@@ -86,7 +82,6 @@ class DelegationTests(unittest.TestCase):
                 response = {"facts": found, "evidence": found}
                 return {
                     "id": task["id"], "status": "success", "response": response,
-                    "usage": {"input_tokens": 10000, "output_tokens": 100, "total_tokens": 10100},
                     "cache_hit": False,
                 }
 
@@ -103,18 +98,14 @@ class DelegationTests(unittest.TestCase):
             self.assertEqual(result["failed_workers"], 0)
             self.assertEqual(set(result["result"]["evidence"]), expected)
             self.assertNotIn("reports", result)
-            self.assertGreaterEqual(result["usage"]["input_tokens"], 20000)
             self.assertEqual(result["route"]["decision"], "delegate")
-            self.assertGreater(result["route"]["estimated_agy_reduce_input_tokens"], 0)
+            self.assertGreater(result["route"]["agy_calls"], 2)  # maps + reduce
 
-    def test_cache_hit_skips_process_and_separates_saved_usage(self) -> None:
+    def test_cache_hit_skips_process(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             prompt = "stable prompt"
             task = {"id": "a", "prompt": prompt}
-            payload = {
-                "status": "SUCCESS", "response": '{"summary":"stable"}',
-                "usage": {"input_tokens": 9001, "output_tokens": 20, "total_tokens": 9021},
-            }
+            payload = {"status": "SUCCESS", "response": '{"summary":"stable"}'}
 
             def fake_subprocess(*args: object, **kwargs: object) -> object:
                 from subprocess import CompletedProcess
@@ -131,8 +122,7 @@ class DelegationTests(unittest.TestCase):
             self.assertEqual(execute.call_count, 1)
             self.assertFalse(first["cache_hit"])
             self.assertTrue(second["cache_hit"])
-            self.assertEqual(second["usage"], {})
-            self.assertEqual(second["cache_avoided_usage"]["total_tokens"], 9021)
+            self.assertEqual(second["response"], first["response"])
 
     def test_reduce_failure_returns_partial_without_raw_reports(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -144,11 +134,11 @@ class DelegationTests(unittest.TestCase):
                     return {
                         "id": "reduce", "status": "error", "response": "",
                         "error_category": "model_or_protocol_error", "retryable": False,
-                        "attempts": 1, "usage": {},
+                        "attempts": 1,
                     }
                 return {
                     "id": task["id"], "status": "success", "response": {"ok": True},
-                    "usage": {"input_tokens": 10}, "cache_hit": False,
+                    "cache_hit": False,
                 }
 
             with patch.object(run_cluster, "run_one", side_effect=fake_run_one):
@@ -165,7 +155,7 @@ class DelegationTests(unittest.TestCase):
             self.assertFalse(result["coverage_complete"])
             self.assertIn("reduce", result["missing_worker_ids"])
             self.assertNotIn("reports", result)
-            public = agy_delegate.public_envelope(result, tool="test")
+            public = agy_delegate.public_envelope(result)
             self.assertEqual(public["result_kind"], "unmerged_map_reports")
             self.assertFalse(agy_mcp_server.is_error_result(public))
 
@@ -173,7 +163,6 @@ class DelegationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             payload = {
                 "status": "SUCCESS", "response": "stable",
-                "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
             }
 
             def fake_subprocess(*args: object, **kwargs: object) -> object:
@@ -195,7 +184,7 @@ class DelegationTests(unittest.TestCase):
     def test_transient_failure_retries_once(self) -> None:
         from subprocess import CompletedProcess
 
-        payload = {"status": "SUCCESS", "response": "recovered", "usage": {"total_tokens": 3}}
+        payload = {"status": "SUCCESS", "response": "recovered"}
         calls = [
             CompletedProcess(["fake"], 1, "", "503 service unavailable"),
             CompletedProcess(["fake"], 0, json.dumps(payload), ""),
@@ -223,30 +212,10 @@ class DelegationTests(unittest.TestCase):
                 cwd=None, stdin_payload=None, timeout=5, cancel_event=event,
             )
 
-    def test_mcp_batch_reports_aggregate_usage_and_cache_savings(self) -> None:
-        prompts = [
-            {"id": "cold", "prompt": "x" * 60000},
-            {"id": "warm", "prompt": "y" * 60000},
-        ]
-        results = [
-            {"id": "cold", "status": "success", "response": {"summary": "a"},
-             "usage": {"input_tokens": 100, "total_tokens": 110}, "cache_hit": False,
-             "estimated_total_input_tokens": 9100},
-            {"id": "warm", "status": "success", "response": {"summary": "a"},
-             "usage": {}, "cache_hit": True, "cache_avoided_usage": {"input_tokens": 100, "total_tokens": 110},
-             "cache_avoided_input_tokens": 9100},
-        ]
-        with patch.object(run_cluster, "resolve_agy", return_value="mock"), patch.object(run_cluster, "run_one", side_effect=results):
-            result = agy_mcp_server.run_tasks(prompts, {"workers": 2, "result_mode": "compact"})
-        self.assertEqual(result["cache"], {"hits": 1, "misses": 1, "avoided_input_tokens": 9100})
-        self.assertEqual(result["usage"]["input_tokens"], 100)
-        self.assertEqual(result["cache_avoided_usage"]["total_tokens"], 110)
-        self.assertEqual(result["agy_prompt_tokens_estimated"]["uncached_equivalent_estimated"], 18200)
-
     def test_mcp_batch_deadline_returns_stable_error(self) -> None:
         def slow_run_one(task: dict[str, str], **kwargs: object) -> dict[str, object]:
             time.sleep(0.05)
-            return {"id": task["id"], "status": "success", "response": {"ok": True}, "usage": {}}
+            return {"id": task["id"], "status": "success", "response": {"ok": True}}
 
         prompts = [{"id": "slow", "prompt": "x" * 60000}]
         with patch.object(run_cluster, "resolve_agy", return_value="mock"), patch.object(run_cluster, "run_one", side_effect=slow_run_one):
@@ -269,7 +238,6 @@ def fact_run_one(task: dict[str, str], **kwargs: object) -> dict[str, object]:
         "id": task["id"], "status": "success",
         "response": run_cluster.compact_value(response, budget),
         "truncated": run_cluster.response_exceeds(response, budget),
-        "usage": {"input_tokens": 10000, "output_tokens": 100, "total_tokens": 10100},
         "cache_hit": False,
     }
 
@@ -339,10 +307,10 @@ class HardeningTests(unittest.TestCase):
                     cache_enabled=False,
                 )
             self.assertGreater(result["truncated_reports"], 0)
-            public = agy_delegate.public_envelope(result, tool="test")
+            public = agy_delegate.public_envelope(result)
             self.assertEqual(public["truncated_reports"], result["truncated_reports"])
 
-    def test_public_envelope_is_lean_and_ledger_keeps_telemetry(self) -> None:
+    def test_public_envelope_is_lean(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "source.txt"
             source.write_text("\n".join(f"FACT-{i:02d}: " + ("长" * 6000) for i in range(1, 7)), encoding="utf-8")
@@ -353,17 +321,9 @@ class HardeningTests(unittest.TestCase):
                     max_output_chars=3000, workers=2, timeout=5, retries=0, transport="auto",
                     cache_enabled=False,
                 )
-            public = agy_delegate.public_envelope(full, tool="test", ledger_dir=temp)
-            self.assertNotIn("route", public)
-            self.assertNotIn("usage", public)
+            public = agy_delegate.public_envelope(full)
+            self.assertEqual(set(public), {"status", "result"})
             self.assertEqual(public["result"], full["result"])
-            self.assertGreater(public["tokens"]["agy_calls"], 1)
-            overhead = len(json.dumps({k: v for k, v in public.items() if k != "result"}, ensure_ascii=False))
-            self.assertLess(overhead, 260)
-            record = json.loads((Path(temp) / "runs.jsonl").read_text(encoding="utf-8").splitlines()[-1])
-            self.assertEqual(record["run_id"], public["run_id"])
-            self.assertEqual(record["route"]["decision"], "delegate")
-            self.assertNotIn("result", record)
 
     def test_direct_public_envelope_tells_parent_to_handle(self) -> None:
         envelope = agy_delegate.delegate(
@@ -371,13 +331,13 @@ class HardeningTests(unittest.TestCase):
             overlap_chars=800, auto_chunk_chars=40000, max_file_bytes=1000,
             max_output_chars=3000, workers=1, timeout=5, retries=0, transport="auto",
         )
-        public = agy_delegate.public_envelope(envelope, tool="test")
+        public = agy_delegate.public_envelope(envelope)
         self.assertEqual(public["action"], "handle_in_parent")
         self.assertLess(len(json.dumps(public, ensure_ascii=False)), 200)
 
     def test_cache_write_failure_keeps_successful_result(self) -> None:
         from subprocess import CompletedProcess
-        payload = {"status": "SUCCESS", "response": "ok", "usage": {"total_tokens": 3}}
+        payload = {"status": "SUCCESS", "response": "ok"}
         with tempfile.TemporaryDirectory() as temp, \
                 patch.object(run_cluster.subprocess, "run", return_value=CompletedProcess(["x"], 0, json.dumps(payload), "")), \
                 patch.object(Path, "replace", side_effect=PermissionError("sharing violation")):
@@ -413,7 +373,7 @@ class ScenarioRegressionTests(unittest.TestCase):
 
             def fake(task: dict[str, str], **kwargs: object) -> dict[str, object]:
                 calls.append(task["id"])
-                return {"id": task["id"], "status": "success", "response": {"ok": True}, "usage": {}, "cache_hit": False}
+                return {"id": task["id"], "status": "success", "response": {"ok": True}, "cache_hit": False}
 
             with patch.object(run_cluster, "run_one", side_effect=fake):
                 result = agy_delegate.delegate(
@@ -426,7 +386,7 @@ class ScenarioRegressionTests(unittest.TestCase):
             self.assertLessEqual(len(calls), 3)
             # An explicit chunk size is honoured as characters.
             explicit = agy_delegate.route_estimate("t", "c", [("f", "a" * 200000)], 3000, 40000, 800, 1)
-            self.assertEqual(explicit["estimated_candidate_agy_calls"], 7)  # 6 maps + reduce
+            self.assertEqual(explicit["agy_calls"], 7)  # 6 maps + reduce
 
     def test_inline_batch_prompt_routes_direct(self) -> None:
         with patch.object(run_cluster, "resolve_agy", side_effect=AssertionError("must not resolve AGY")):
@@ -438,7 +398,7 @@ class ScenarioRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "doc.txt"
             source.write_text("长" * 30000, encoding="utf-8")
-            done = {"id": "doc", "status": "success", "response": {"ok": True}, "usage": {"total_tokens": 5}, "cache_hit": False}
+            done = {"id": "doc", "status": "success", "response": {"ok": True}, "cache_hit": False}
             with patch.object(run_cluster, "resolve_agy", return_value="mock"), \
                     patch.object(run_cluster, "run_one", return_value=done):
                 result = agy_mcp_server.run_request({"prompts": [{"id": "doc", "instruction": "Summarize.", "file": str(source)}]})
@@ -487,7 +447,7 @@ class CacheEnvTests(unittest.TestCase):
     def test_env_switch_disables_cache(self) -> None:
         import os
         from subprocess import CompletedProcess
-        payload = {"status": "SUCCESS", "response": "ok", "usage": {"total_tokens": 1}}
+        payload = {"status": "SUCCESS", "response": "ok"}
         kwargs = dict(agy="f", model="m", effort="high", mode="plan", cwd=None, timeout=1, retries=0,
                       transport="argv", argv_limit=10000, result_mode="compact", max_response_chars=3000)
         with tempfile.TemporaryDirectory() as temp,                 patch.dict(os.environ, {"AGY_SUBAGENTS_CACHE": "0"}),                 patch.object(run_cluster.subprocess, "run", return_value=CompletedProcess(["x"], 0, json.dumps(payload), "")) as run:
@@ -529,7 +489,7 @@ class NativeLikeTests(unittest.TestCase):
 
             def fake(task: dict[str, str], **kwargs: object) -> dict[str, object]:
                 seen.append(task["prompt"])
-                return {"id": task["id"], "status": "success", "usage": {}, "cache_hit": False,
+                return {"id": task["id"], "status": "success", "cache_hit": False,
                         "response": {"evidence": ["doc.txt:L12", "doc.txt:L40-L42", "doc.txt:L9999"]}}
 
             with patch.object(run_cluster, "run_one", side_effect=fake):
@@ -542,7 +502,7 @@ class NativeLikeTests(unittest.TestCase):
             self.assertIn("file:L<line>", seen[0])  # default contract asks for locators
             self.assertIn("compact JSON", seen[0])
             self.assertEqual(result["locator_check"], {"locators": 3, "invalid_locators": 1})
-            public = agy_delegate.public_envelope(result, tool="test")
+            public = agy_delegate.public_envelope(result)
             self.assertEqual(public["invalid_locators"], 1)
             self.assertNotIn("coverage_complete", public)
 
@@ -558,7 +518,7 @@ class NativeLikeTests(unittest.TestCase):
 
             def fake(task: dict[str, str], **kwargs: object) -> dict[str, object]:
                 prompts.append(task["prompt"])
-                return {"id": task["id"], "status": "success", "response": {"ok": 1}, "usage": {}, "cache_hit": False}
+                return {"id": task["id"], "status": "success", "response": {"ok": 1}, "cache_hit": False}
 
             with patch.object(run_cluster, "run_one", side_effect=fake):
                 result = agy_delegate.delegate(
@@ -567,7 +527,7 @@ class NativeLikeTests(unittest.TestCase):
                     timeout=5, retries=0, transport="auto", cache_enabled=False,
                 )
             maps = [p for p in prompts if "BEGIN FILE" in p]
-            self.assertEqual(len(maps), result["route"]["estimated_candidate_agy_calls"] - 1)
+            self.assertEqual(len(maps), result["route"]["agy_calls"] - 1)
             self.assertIn("L1200| ", maps[-1])
             self.assertNotIn("L1| ", maps[-1])
 
@@ -580,7 +540,7 @@ class NativeLikeTests(unittest.TestCase):
                 auto_chunk_chars=40000, max_file_bytes=500000, max_output_chars=3000, workers=1,
                 timeout=5, retries=0, transport="auto", difficulty="high",
             )
-            public = agy_delegate.public_envelope(envelope, tool="test")
+            public = agy_delegate.public_envelope(envelope)
             self.assertEqual(public["status"], "direct")
             self.assertIn("difficulty=low", public["hint"])
 
@@ -592,7 +552,7 @@ class NativeLikeTests(unittest.TestCase):
         with patch.object(agy_mcp_server, "reply", side_effect=lambda rid, result=None, error=None: replies.append(result)):
             agy_mcp_server.call_tool(1, "agy_delegate", {"task": "x", "chunk_size": 5})
             # Advanced knobs stay accepted even though they are not listed.
-            agy_mcp_server.call_tool(2, "agy_delegate", {"task": "x", "cost_mode": "balanced", "telemetry": "summary"})
+            agy_mcp_server.call_tool(2, "agy_delegate", {"task": "x", "cost_mode": "balanced"})
             agy_mcp_server.call_tool(3, "agy_summarize_file", {"path": "missing.txt", "task": "x"})
         self.assertTrue(replies[0]["isError"])
         self.assertIn("chunk_size", replies[0]["content"][0]["text"])
@@ -615,7 +575,7 @@ class McpStdioTests(unittest.TestCase):
                     "task": "x", "files": [str(Path(temp) / "不存在😀.txt")], "output_contract": "y"}}},
             ]
             stdin = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in requests).encode("utf-8")
-            env = {**os.environ, "PYTHONIOENCODING": "", "PYTHONUTF8": "0", "AGY_SUBAGENTS_LEDGER": "0"}
+            env = {**os.environ, "PYTHONIOENCODING": "", "PYTHONUTF8": "0"}
             completed = subprocess.run(
                 [sys.executable, str(SCRIPT_DIR / "agy_mcp_server.py")],
                 input=stdin, capture_output=True, timeout=30, env=env,

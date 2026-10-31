@@ -40,12 +40,6 @@ MAX_SOURCE_BYTES = 32 * 1024 * 1024
 DEFAULT_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_CACHE_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "agy" / "cache" / "agy-subagents"
 ESTIMATED_FIXED_CONTEXT_TOKENS = 9000
-
-
-DEFAULT_LEDGER_DIR = Path(
-    os.environ.get("AGY_SUBAGENTS_LEDGER_DIR")
-    or Path(os.environ.get("LOCALAPPDATA", Path.home())) / "agy" / "telemetry" / "agy-subagents"
-)
 CACHE_PRUNE_INTERVAL_SECONDS = 6 * 60 * 60
 
 # Files that very likely hold credentials. They are refused unless the caller
@@ -223,7 +217,7 @@ def expand_path(raw_path: str) -> Path:
 
 
 def estimate_tokens(text: str) -> int:
-    """Conservative local estimate; actual usage must come from AGY telemetry."""
+    """Conservative character heuristic used for routing and chunk sizing."""
     if not text:
         return 0
     non_ascii = sum(ord(char) > 127 for char in text)
@@ -241,8 +235,7 @@ def cache_key(*parts: str) -> str:
 
 
 def cache_disabled_by_env() -> bool:
-    """AGY_SUBAGENTS_CACHE=0 turns the cache off process-wide (used by evals
-    so a run cannot reuse results paid for by an earlier run)."""
+    """AGY_SUBAGENTS_CACHE=0 turns the cache off process-wide."""
     return os.environ.get("AGY_SUBAGENTS_CACHE", "1") == "0"
 
 
@@ -304,7 +297,7 @@ def cache_write(
         directory.mkdir(parents=True, exist_ok=True)
         target = directory / f"{key}.json"
         temp = target.with_suffix(f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        safe = {name: result.get(name) for name in ("status", "response", "usage", "transport", "truncated")}
+        safe = {name: result.get(name) for name in ("status", "response", "transport", "truncated")}
         temp.write_text(json.dumps(safe, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
         try:
             temp.replace(target)
@@ -742,17 +735,12 @@ def run_one(
     cache_dir = cache_dir if result_mode == "compact" and cache_ttl_seconds > 0 else None
     cached = cache_read(cache_dir, key, cache_ttl_seconds)
     if cached:
-        old_usage = cached.get("usage") or {}
-        avoided_input = int(old_usage.get("input_tokens", 0) or 0) or (estimate_tokens(prompt) + ESTIMATED_FIXED_CONTEXT_TOKENS)
         return {
             "id": task["id"], "status": "success", "response": cached["response"],
-            "usage": {}, "attempts": 0, "cache_hit": True,
+            "attempts": 0, "cache_hit": True,
             "truncated": bool(cached.get("truncated", False)),
-            "cache_avoided_usage": old_usage,
-            "cache_avoided_input_tokens": avoided_input,
             "transport": cached.get("transport", "cache"),
         }
-    estimated_input_tokens = estimate_tokens(prompt)
     use_stream = transport == "stream" or (transport == "auto" and len(prompt) > argv_limit)
     command, stdin_payload = build_command(
         agy,
@@ -763,7 +751,6 @@ def run_one(
         use_stream=use_stream,
         prompt=prompt,
     )
-    started = time.monotonic()
     last_error = ""
     attempts = 0
     for attempts in range(1, retries + 2):
@@ -813,11 +800,6 @@ def run_one(
                 "id": task["id"],
                 "status": "success",
                 "response": response if result_mode == "full" else compact_response(response, max_response_chars),
-                "conversation_id": payload.get("conversation_id"),
-                "duration_seconds": payload.get("duration_seconds"),
-                "usage": payload.get("usage"),
-                "estimated_input_tokens": estimated_input_tokens,
-                "estimated_total_input_tokens": estimated_input_tokens + ESTIMATED_FIXED_CONTEXT_TOKENS,
                 "attempts": attempts,
                 "cache_hit": False,
                 "truncated": result_mode != "full" and response_exceeds(response, max_response_chars),
@@ -845,7 +827,7 @@ def run_one(
         "id": task["id"],
         "status": "error",
         "response": "",
-        "error": "AGY task failed; retry only if telemetry marks this failure transient.",
+        "error": "AGY task failed; retry only if retryable is true.",
         "error_category": (
             "permission_denied" if is_deterministic_failure(last_error)
             else "overall_timeout" if "overall delegation deadline" in last_error.lower()
@@ -855,9 +837,6 @@ def run_one(
         ),
         "attempts": attempts,
         "retryable": is_transient_failure(last_error) and not is_deterministic_failure(last_error),
-        "estimated_input_tokens": estimated_input_tokens,
-        "estimated_total_input_tokens": estimated_input_tokens + ESTIMATED_FIXED_CONTEXT_TOKENS,
-        "duration_seconds": round(time.monotonic() - started, 3),
     }
 
 
@@ -913,73 +892,6 @@ def run_parallel(
     finally:
         pool.shutdown(wait=not timed_out, cancel_futures=True)
     return [results[index] for index in range(len(tasks))]
-
-
-USAGE_FIELDS = ("input_tokens", "output_tokens", "thinking_tokens", "reasoning_output_tokens", "cache_read_tokens", "cached_input_tokens", "total_tokens")
-
-
-def summarize_runs(results: list[dict[str, Any]]) -> dict[str, Any]:
-    """Usage/cache/estimate totals over executed results (direct ones excluded)."""
-    executed = [item for item in results if item.get("status") != "direct"]
-    return {
-        "usage": aggregate_usage(executed),
-        "cache": aggregate_cache(executed),
-        "cache_avoided_usage": {field: sum(int((item.get("cache_avoided_usage") or {}).get(field, 0) or 0) for item in executed) for field in USAGE_FIELDS},
-        "agy_prompt_tokens_estimated": aggregate_prompt_estimates(executed),
-    }
-
-
-def new_run_id() -> str:
-    return time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
-
-
-def ledger_write(record: dict[str, Any], ledger_dir: str | Path | None = None) -> str | None:
-    """Append one metrics-only record (no source text, no results) to a local
-    JSONL ledger. Full telemetry stays on disk so it never re-enters GPT
-    context, while ``run_id`` keeps every call traceable. Best-effort."""
-    directory = Path(ledger_dir) if ledger_dir else DEFAULT_LEDGER_DIR
-    if os.environ.get("AGY_SUBAGENTS_LEDGER", "1") == "0":
-        return None
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-        target = directory / "runs.jsonl"
-        line = json.dumps({"ts": round(time.time(), 3), **record}, ensure_ascii=False, separators=(",", ":"))
-        with _ledger_lock, target.open("a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
-        return str(target)
-    except (OSError, TypeError, ValueError):
-        return None
-
-
-_ledger_lock = threading.Lock()
-
-
-def nonzero(values: dict[str, Any] | None) -> dict[str, Any]:
-    """Drop zero-valued counters so compact envelopes stay small."""
-    return {key: value for key, value in (values or {}).items() if value}
-
-
-def aggregate_usage(results: list[dict[str, Any]]) -> dict[str, int]:
-    fields = ("input_tokens", "output_tokens", "thinking_tokens", "reasoning_output_tokens", "cache_read_tokens", "cached_input_tokens", "total_tokens")
-    return {
-        field: sum(int((item.get("usage") or {}).get(field, 0) or 0) for item in results)
-        for field in fields
-    }
-
-
-def aggregate_cache(results: list[dict[str, Any]]) -> dict[str, int]:
-    return {
-        "hits": sum(bool(item.get("cache_hit")) for item in results),
-        # A miss is an AGY call that was actually launched.
-        "misses": sum(not item.get("cache_hit") and int(item.get("attempts", 1) or 0) > 0 for item in results),
-        "avoided_input_tokens": sum(int(item.get("cache_avoided_input_tokens", 0) or 0) for item in results),
-    }
-
-
-def aggregate_prompt_estimates(results: list[dict[str, Any]]) -> dict[str, int]:
-    sent = sum(int(item.get("estimated_total_input_tokens", 0) or 0) for item in results if not item.get("cache_hit"))
-    avoided = sum(int(item.get("cache_avoided_input_tokens", 0) or 0) for item in results)
-    return {"sent_estimated": sent, "avoided_estimated": avoided, "uncached_equivalent_estimated": sent + avoided}
 
 
 def main() -> int:
@@ -1068,23 +980,8 @@ def main() -> int:
         "count": len(results),
         "failed": failed,
         "results": results,
-        **summarize_runs(results),
         "total_timeout": args.total_timeout,
     }
-    run_id = new_run_id()
-    ledger_write({
-        "run_id": run_id,
-        "tool": "run_cluster",
-        "status": envelope["status"],
-        "count": envelope["count"],
-        "failed": envelope["failed"],
-        "workers": envelope["workers"],
-        "usage": nonzero(envelope.get("usage")),
-        "cache": envelope.get("cache", {}),
-        "cache_avoided_usage": nonzero(envelope.get("cache_avoided_usage")),
-        "agy_prompt_tokens_estimated": envelope.get("agy_prompt_tokens_estimated", {}),
-    })
-    envelope["run_id"] = run_id
     serialized = json.dumps(envelope, ensure_ascii=False)
     if args.output_file:
         try:

@@ -40,9 +40,8 @@ perspectives: [reader, critic]   # 可选；只在需要互补审查时加，每
 | `truncated_reports` | 有报告超长被截断 | 视为可能遗漏；缩小范围或提高 `max_output_chars` |
 | `invalid_locators` | 有定位超出文件行数 | 相关结论可疑，必须回原文核验 |
 | `result_kind=unmerged_map_reports` | 归并失败，返回的是分块报告 | 自己合并 |
-| `tokens`、`run_id` | 开销摘要、账本记录号 | 无需处理；`python scripts/agy_ledger.py --run-id <id>` 可查明细 |
 
-字段不出现即表示正常。除非在调试，不要索要内部 worker 报告或 `telemetry=full`。
+字段不出现即表示正常。不要索要内部 worker 报告。
 
 ## 边界
 

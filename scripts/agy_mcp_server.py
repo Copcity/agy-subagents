@@ -60,20 +60,20 @@ def reply(request_id: Any, result: dict[str, Any] | None = None, error: dict[str
 DELEGATE_ADVANCED = {
     "chunk_chars", "overlap_chars", "auto_chunk_chars", "workers", "timeout", "total_timeout",
     "retries", "transport", "cost_mode", "cache_enabled", "cache_ttl_days", "max_file_bytes",
-    "telemetry", "allow_sensitive", "requires_gpt",
+    "allow_sensitive", "requires_gpt",
 }
 ACCEPTED_ARGS = {
     "agy_delegate": {"task", "files", "output_contract", "perspectives", "difficulty", "max_output_chars"} | DELEGATE_ADVANCED,
     "agy_subagents": {
         "prompts", "max_response_chars", "output_file", "workers", "timeout", "total_timeout", "retries",
         "transport", "result_mode", "allow_tools", "auto_chunk_chars", "cost_mode", "cache_enabled",
-        "cache_ttl_days", "max_file_bytes", "telemetry", "allow_sensitive",
+        "cache_ttl_days", "max_file_bytes", "allow_sensitive",
     },
     # Legacy alias; no longer listed, still dispatched for old prompts.
     "agy_summarize_file": {
         "path", "task", "chunk_chars", "overlap_chars", "max_output_chars", "workers", "timeout",
         "total_timeout", "retries", "max_file_bytes", "difficulty", "requires_gpt", "cost_mode",
-        "telemetry", "allow_sensitive", "cache_enabled", "cache_ttl_days",
+        "allow_sensitive", "cache_enabled", "cache_ttl_days",
     },
 }
 
@@ -162,11 +162,7 @@ def run_tasks(
             offloaded_tokens=task.get("offloaded_tokens"),
         )
         if route["decision"] == "direct":
-            direct_results[index] = {
-                "id": task["id"], "status": "direct", "response": None,
-                "route": route,
-                "estimated_input_tokens": run_cluster.estimate_tokens(prompt_text),
-            }
+            direct_results[index] = {"id": task["id"], "status": "direct", "response": None, "route": route}
         else:
             eligible.append((index, task))
     if not eligible:
@@ -174,8 +170,6 @@ def run_tasks(
             "status": "direct", "model": "gemini-3.8-flash-high", "workers": 0,
             "count": len(prompts), "failed": 0,
             "results": [direct_results[index] for index in range(len(prompts))],
-            "usage": {}, "cache": {"hits": 0, "misses": 0, "avoided_input_tokens": 0},
-            "agy_prompt_tokens_estimated": {"sent_estimated": 0, "avoided_estimated": 0},
             "errors": [], "total_timeout": total_timeout,
         }
     agy = run_cluster.resolve_agy(arguments.get("agy"))
@@ -212,7 +206,6 @@ def run_tasks(
     results = [direct_results[index] if index in direct_results else executed[index] for index in range(len(prompts))]
     failed = sum(result.get("status") not in {"success", "direct"} for result in results)
     actual = [result for result in results if result.get("status") == "success"]
-    totals = run_cluster.summarize_runs(results)
     errors = [
         {
             "id": str(result.get("id")),
@@ -232,7 +225,6 @@ def run_tasks(
         "count": len(results),
         "failed": failed,
         "results": results,
-        **totals,
         "errors": errors,
         "total_timeout": total_timeout,
     }
@@ -285,7 +277,7 @@ def run_delegate(arguments: dict[str, Any], cancel_event: threading.Event | None
         allow_sensitive=bool(arguments.get("allow_sensitive", False)),
         cancel_event=cancel_event,
     )
-    return agy_delegate.public_envelope(envelope, tool="agy_delegate", telemetry=str(arguments.get("telemetry", "summary")))
+    return agy_delegate.public_envelope(envelope)
 
 
 def run_request(arguments: dict[str, Any], cancel_event: threading.Event | None = None) -> dict[str, Any]:
@@ -305,28 +297,17 @@ def run_request(arguments: dict[str, Any], cancel_event: threading.Event | None 
     )
     prompts = run_cluster.load_prompts(args)
     envelope = run_tasks(prompts, arguments, cancel_event=cancel_event)
-    run_id = run_cluster.new_run_id()
-    run_cluster.ledger_write({
-        "run_id": run_id, "tool": "agy_subagents", "status": envelope["status"],
-        "count": envelope["count"], "failed": envelope["failed"], "workers": envelope.get("workers", 0),
-        "errors": envelope.get("errors", []), "usage": run_cluster.nonzero(envelope.get("usage")),
-        "cache": envelope.get("cache", {}), "cache_avoided_usage": run_cluster.nonzero(envelope.get("cache_avoided_usage")),
-        "agy_prompt_tokens_estimated": envelope.get("agy_prompt_tokens_estimated", {}),
-        "routes": [item.get("route") for item in envelope["results"] if item.get("route")],
-    })
     output_file = arguments.get("output_file")
     if output_file:
         output_path = run_cluster.expand_path(str(output_file))
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps({**envelope, "run_id": run_id}, ensure_ascii=False) + "\n", encoding="utf-8")
-        return {"status": envelope["status"], "output_file": str(output_path), "count": envelope["count"], "failed": envelope["failed"], "run_id": run_id}
-    if str(arguments.get("telemetry", "summary")) == "full":
-        return {**envelope, "run_id": run_id}
-    return lean_batch(envelope, run_id)
+        output_path.write_text(json.dumps(envelope, ensure_ascii=False) + "\n", encoding="utf-8")
+        return {"status": envelope["status"], "output_file": str(output_path), "count": envelope["count"], "failed": envelope["failed"]}
+    return lean_batch(envelope)
 
 
-def lean_batch(envelope: dict[str, Any], run_id: str) -> dict[str, Any]:
-    """Per-result id/status/response plus one token line for the batch."""
+def lean_batch(envelope: dict[str, Any]) -> dict[str, Any]:
+    """Per-result id/status/response only."""
     results = []
     for item in envelope["results"]:
         entry: dict[str, Any] = {"id": item.get("id"), "status": item.get("status")}
@@ -341,18 +322,7 @@ def lean_batch(envelope: dict[str, Any], run_id: str) -> dict[str, Any]:
             entry["category"] = item.get("error_category") or "worker_error"
             entry["retryable"] = bool(item.get("retryable", False))
         results.append(entry)
-    usage = envelope.get("usage") or {}
-    cache = envelope.get("cache") or {}
-    tokens = {
-        key: value
-        for key, value in {
-            "agy_calls": int(cache.get("misses", 0) or 0),
-            "agy_total": int(usage.get("total_tokens", 0) or 0),
-            "cache_hits": int(cache.get("hits", 0) or 0),
-        }.items()
-        if value
-    }
-    return {"status": envelope["status"], "failed": envelope["failed"], "results": results, "tokens": tokens, "run_id": run_id}
+    return {"status": envelope["status"], "failed": envelope["failed"], "results": results}
 
 
 def summarize_file(arguments: dict[str, Any], cancel_event: threading.Event | None = None) -> dict[str, Any]:
@@ -390,7 +360,7 @@ def summarize_file(arguments: dict[str, Any], cancel_event: threading.Event | No
         allow_sensitive=bool(arguments.get("allow_sensitive", False)),
         cancel_event=cancel_event,
     )
-    public = agy_delegate.public_envelope(result, tool="agy_summarize_file", telemetry=str(arguments.get("telemetry", "summary")))
+    public = agy_delegate.public_envelope(result)
     if "result" in public:
         public["summary"] = public.pop("result")
     return public
