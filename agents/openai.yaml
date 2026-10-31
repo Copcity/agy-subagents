@@ -1,0 +1,6 @@
+interface:
+  display_name: "AGY Subagents"
+  short_description: "Offload long-file reading to local AGY; get back a compact, cited result"
+  default_prompt: "Use $agy-subagents: call agy_delegate with the task and file paths, then spot-check the cited file:L lines."
+policy:
+  allow_implicit_invocation: true
