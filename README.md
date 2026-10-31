@@ -1,18 +1,19 @@
 # AGY Subagents
 
-把长文件的阅读、摘要、抽取和中低难度分析，委派给本机 [AGY](#前置条件) 外部子代理（默认 Gemini 3.8 Flash High），只把精炼、带行号定位、可核验的结果交还给主模型，从而节省主模型（如 Codex / GPT）的上下文。
+给 Codex 主模型配备一个子代理集群，子代理由 **Antigravity（AGY）中的 Gemini 3.8 Flash (High)** 担任。目标是**在不损失主模型能力的前提下节约主模型 token**，同时把 Google AI Pro 账号里闲置的 Antigravity 额度用起来。
 
-它以 **Codex Skill + stdio MCP Server** 的形式提供，纯 Python 标准库实现，无需安装任何第三方依赖。
+> **适用范围**：本项目只针对 **Codex** 做过实验和优化（技能触发方式、工具 schema 体积、返回格式、提示词都按 Codex 调过）。其他支持 MCP 的 agent 也能调用，但不保证能完全发挥效果。
 
 ```text
-主模型 ──agy_delegate(task, files)──▶ 本地路由估算 ──▶ direct：主模型自己处理
-                                         │
-                                         └──▶ 分块 ─▶ AGY map（并行）─▶ AGY reduce ─▶ 精炼 JSON + file:L<n> 定位
+Codex 主模型 ──agy_delegate(task, files)──▶ 本地路由估算 ──▶ direct：主模型自己处理
+                                               │
+                                               └──▶ 分块 ─▶ Gemini 3.8 Flash (High) 并行 map ─▶ reduce ─▶ 精炼 JSON + file:L<n> 定位
 ```
 
 ## 目录
 
-- [为什么需要它](#为什么需要它)
+- [解决什么问题](#解决什么问题)
+- [如何做到不损失主模型能力](#如何做到不损失主模型能力)
 - [特性](#特性)
 - [前置条件](#前置条件)
 - [安装](#安装)
@@ -27,19 +28,36 @@
 - [已知限制](#已知限制)
 - [许可证](#许可证)
 
-## 为什么需要它
+## 解决什么问题
 
-主模型直接读一份 8 万 token 的文档，这 8 万 token 会留在上下文里，并在之后每一轮工具调用中被重复计费。把"读长文"这一步交给一个便宜、上下文独立的子代理，主模型只需读回几百 token 的结论和定位，再按定位抽查原文几行即可。
+**主模型 token 消耗太快。** Codex 读一份 8 万 token 的文档，这 8 万 token 会留在上下文里，之后每一轮工具调用都会被重复计费，也会更快触发上下文压缩。大部分"读长文"工作是抽取、摘要、定位这类中低难度任务，不需要主模型亲自读。
 
-实测（合成数据，真实 AGY）：原文 2.4 万–8.3 万 token 的抽取、对比任务，主模型读回 **65–284 token**，事实覆盖满分。
+**Google AI Pro 的额度没地方用。** 订阅 Google AI Pro 后，Antigravity 里的 Gemini 额度如果不写代码就基本闲置。本项目把这部分额度变成 Codex 的"读长文外包"：Gemini 3.8 Flash (High) 负责读原文，Codex 只读回几百 token 的结论和行号定位。
 
-分工原则：
+实测（合成数据，真实 AGY）：原文 2.4 万–8.3 万 token 的抽取、对比任务，Codex 读回 **65–284 token**，事实覆盖满分。
 
-| 主模型 | AGY 子代理 |
+## 如何做到不损失主模型能力
+
+节约 token 的前提是主模型的判断质量不下降。设计上有以下约束：
+
+| 机制 | 作用 |
 |---|---|
-| 拆分任务、高难度推理、最终判断 | 读长文本 |
+| 只委派中低难度任务 | 抽取、摘要、分类、对比、定位、初步审查交给 Gemini；`difficulty=high` 直接返回 `direct`，由主模型处理 |
+| 高难度任务拆两步 | 先让 Gemini 抽取相关段落并给出定位，再由主模型基于抽取结果推理 |
+| 结果必须带定位 | 证据以 `file:L<n>` 返回，主模型按定位只读几行原文即可核验，桥接还会检查定位是否越界 |
+| 结果视为草稿 | Gemini 的输出是不可信草稿，关键结论由主模型抽查后才交给用户 |
+| 不划算就不委派 | 调用前本地估算，短文件或省不了 token 的任务返回 `direct`，避免多付一轮 |
+| 副作用留在主模型 | 文件修改、命令执行、发布、对外通信都不交给 Gemini |
+
+分工：
+
+| Codex 主模型 | Gemini 3.8 Flash (High) 子代理集群 |
+|---|---|
+| 拆分任务、高难度推理、最终判断 | 读长文本，可多块并行、多视角互补 |
 | 文件修改、命令执行、对外通信 | 中低难度的抽取、摘要、分类、对比、定位、初步审查 |
 | 按定位核验关键结论 | 只返回一份精炼结果，不带原文 |
+
+需要注意：本项目节约的是**主模型**的 token。AGY 侧每个进程约有 9k token 固定开销，总 token 通常高于主模型直接读原文，这部分消耗的是 Google AI Pro 的 Antigravity 额度。
 
 ## 特性
 
@@ -59,9 +77,9 @@
 | 依赖 | 说明 |
 |---|---|
 | Python | 建议 3.10 及以上（在 3.14 上测试）；只用标准库 |
-| AGY CLI | 本机可执行的 `agy`，需在 `PATH` 中，或位于 `%LOCALAPPDATA%\agy\bin\agy.exe`；也可用 `--agy <path>` 指定 |
-| AGY 模型 | 默认调用 `gemini-3.8-flash-high`，需在 AGY 中可用并已登录 |
-| MCP 客户端 | 推荐 [Codex CLI](https://github.com/openai/codex)；任何支持 stdio MCP 的客户端均可 |
+| Antigravity（AGY）CLI | 本机可执行的 `agy`，需在 `PATH` 中，或位于 `%LOCALAPPDATA%\agy\bin\agy.exe`；也可用 `--agy <path>` 指定 |
+| 账号与模型 | 已在 AGY 中登录 Google AI Pro 账号，且 `gemini-3.8-flash-high` 可用；子代理调用消耗的是该账号的 Antigravity 额度 |
+| 主模型 | [Codex CLI](https://github.com/openai/codex)。本项目只针对 Codex 实验和优化 |
 
 主要在 Windows 上开发和测试，路径约定（`%LOCALAPPDATA%`、`$env:USERPROFILE`）以 Windows 为准；其他平台会回退到用户主目录。
 
@@ -88,7 +106,7 @@ codex mcp add agy-subagents -- python "$env:USERPROFILE\.codex\skills\agy-subage
 codex mcp get agy-subagents   # 检查是否注册成功
 ```
 
-其他 MCP 客户端可使用等价的配置：
+其他支持 stdio MCP 的 agent 可以用下面的等价配置接入。注意本项目只在 Codex 上实验和优化过：`SKILL.md` 的触发规则、精简的工具 schema、返回格式和使用指引都是按 Codex 调的，其他 agent 不一定会在合适的时机调用，也不一定会按定位核验结果，因此不保证能完全发挥效果。
 
 ```json
 {
@@ -302,9 +320,10 @@ python benchmarks/benchmark_delegation.py --compare <旧副本>  # 改动前后�
 ## 已知限制
 
 - **精确计数不可靠。** 需要精确计数、求和、全量去重时请用 grep 或脚本。
-- **AGY 侧总开销更高。** 本项目优化的是主模型上下文，不是总 token；中等长度任务在 `balanced` 模式下基本都会 direct。
+- **只针对 Codex 优化。** 其他 agent 可以通过 MCP 调用，但不保证完全发挥能力。
+- **AGY 侧总开销更高。** 本项目节约的是主模型 token，AGY 侧消耗的是 Google AI Pro 的 Antigravity 额度，总 token 通常更高；额度用尽时子代理调用会失败，需要主模型自己处理。中等长度任务在 `balanced` 模式下基本都会 direct。
 - **token 估算是启发式。** 路由判断基于字符数估算，不是真实 tokenizer。
-- **依赖本机 AGY。** 需要自行安装并登录 AGY CLI；模型名写在 `agy_delegate.py` 和 `agy_mcp_server.py` 中。
+- **依赖本机 Antigravity。** 需要自行安装并登录 AGY CLI；模型名写在 `agy_delegate.py` 和 `agy_mcp_server.py` 中。
 - **主要在 Windows 上验证。** 其他平台理论可用，但缓存与账本路径会回退到用户主目录。
 
 ## 许可证
